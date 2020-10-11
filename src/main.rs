@@ -88,9 +88,18 @@ impl NoteEventsProducer for Event {
 }
 
 #[derive(Debug)]
+pub enum Quantize {
+    Bar,
+    Beat,
+    Tick,
+}
+
+#[derive(Debug)]
 pub struct TimelineEvent {
     event: Event,
     scheduled_at: Instant,
+    reschedule: bool,
+    quantize: Quantize,
 }
 
 #[derive(Debug)]
@@ -127,47 +136,42 @@ impl Timeline {
     // +1. get event from scheduled events (nearest)
     // +2. check event timing
     // +?3. quantize?
-    fn beat(&mut self) {
-        println!("beat: {}", self.current_beat);
+
+    fn process(&mut self) {
+        println!("events = {:?}", self.events);
 
         match self.events.pop_front() {
             Some(te) => {
                 let e = te.event;
-
-                println!(
-                    "event = {:?} @ {:?} ! {:?}",
-                    e.params, te.scheduled_at, self.current_time
-                );
 
                 if te.scheduled_at <= self.current_time {
                     let notes = e.get_notes();
                     for note in notes {
                         let _ = self.sender.send(note);
                     }
-                } else {
-                    self.reschedule(TimelineEvent {
-                        event: e,
-                        scheduled_at: te.scheduled_at,
-                    });
-                }
 
-                // INFO: rescheduling events
-                // self.schedule(e);
+                    if te.reschedule {
+                        match te.quantize {
+                            Quantize::Bar => self.schedule_at_next_bar(e, true),
+                            Quantize::Beat => self.schedule_at_next_beat(e, true),
+                            quantize => self.schedule_at(e, te.scheduled_at, true, quantize),
+                        }
+                    }
+                } else {
+                    self.schedule_at(e, te.scheduled_at, te.reschedule, te.quantize);
+                }
             }
             None => (),
         }
     }
 
+    fn beat(&mut self) {
+        println!("beat: {}", self.current_beat);
+        self.process();
+    }
+
     fn bar(&mut self) {
         println!("bar: {}", self.current_bar);
-
-        // match self.events.pop() {
-        //     Some(e) => {
-        //         println!("event = {:?}", e);
-        //         self.schedule(&e.name, e.params);
-        //     }
-        //     None => (),
-        // }
     }
 
     fn tick_to_beat(&self, tick: u32) -> u32 {
@@ -213,32 +217,57 @@ impl Timeline {
         // );
     }
 
-    fn schedule(&mut self, event: Event) {
+    fn update_time(&mut self) {
+        self.current_time = Instant::now();
+    }
+
+    fn schedule(&mut self, event: Event, reschedule: bool) {
+        self.update_time();
+
         let te = TimelineEvent {
             event: event,
             scheduled_at: self.current_time,
+            reschedule: reschedule,
+            quantize: Quantize::Tick,
         };
 
         self.events.push_back(Box::new(te));
     }
 
-    fn reschedule(&mut self, timeline_event: TimelineEvent) {
-        self.events.push_back(Box::new(timeline_event))
+    fn schedule_at(&mut self, event: Event, at: Instant, reschedule: bool, quantize: Quantize) {
+        self.update_time();
+
+        let te = TimelineEvent {
+            event: event,
+            scheduled_at: at,
+            reschedule: reschedule,
+            quantize: quantize,
+        };
+
+        self.events.push_back(Box::new(te));
     }
 
-    fn schedule_at_next_beat(&mut self, event: Event) {
+    fn schedule_at_next_beat(&mut self, event: Event, reschedule: bool) {
+        self.update_time();
+
         let te = TimelineEvent {
             event: event,
             scheduled_at: self.next_beat_at(),
+            reschedule: reschedule,
+            quantize: Quantize::Beat,
         };
 
         self.events.push_back(Box::new(te));
     }
 
-    fn schedule_at_next_bar(&mut self, event: Event) {
+    fn schedule_at_next_bar(&mut self, event: Event, reschedule: bool) {
+        self.update_time();
+
         let te = TimelineEvent {
             event: event,
             scheduled_at: self.next_bar_at(),
+            reschedule: reschedule,
+            quantize: Quantize::Bar,
         };
 
         self.events.push_back(Box::new(te));
@@ -341,17 +370,24 @@ pub fn main() {
 
     let mut timeline = clock.new_timeline(note_sender);
 
-    let e = Event::new(map! {"note" => "60", "duration" => "100"});
-    timeline.schedule_at_next_bar(e);
+    timeline.schedule_at_next_bar(Event::new(map! {"note" => "76", "duration" => "50"}), true);
 
-    let e = Event::new(map! {"note" => "61", "duration" => "100"});
-    timeline.schedule(e);
-
-    let e = Event::new(map! {"note" => "62", "duration" => "100"});
-    timeline.schedule(e);
-
-    let e = Event::new(map! {"note" => "63", "duration" => "100"});
-    timeline.schedule(e);
+    timeline.schedule_at_next_beat(
+        Event::new(map! {"note" => "60", "duration" => "100"}),
+        false,
+    );
+    timeline.schedule_at_next_beat(
+        Event::new(map! {"note" => "61", "duration" => "100"}),
+        false,
+    );
+    timeline.schedule_at_next_beat(
+        Event::new(map! {"note" => "62", "duration" => "100"}),
+        false,
+    );
+    timeline.schedule_at_next_beat(
+        Event::new(map! {"note" => "63", "duration" => "100"}),
+        false,
+    );
 
     clock.add_timeline(timeline);
 
