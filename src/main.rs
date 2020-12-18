@@ -329,12 +329,37 @@ impl Clock {
     }
 }
 
+trait Backend {
+    fn run(&mut self, receiver: Receiver<NoteEvent>) {
+        loop {
+            let e = receiver.recv().unwrap();
+            self.send(e)
+        }
+    }
+
+    fn send(&mut self, event: NoteEvent);
+}
+
+struct DummyBackend {}
+
+impl DummyBackend {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Backend for DummyBackend {
+    fn send(&mut self, event: NoteEvent) {
+        println!("got event: {:?}", event)
+    }
+}
+
 struct MidiBackend {
     out: Option<MidiOutputConnection>,
 }
 
 impl MidiBackend {
-    fn new(device_name: &str, port_name: &str) -> Self {
+    fn new(device_name: &str) -> Self {
         let midi_out = MidiOutput::new(&device_name).unwrap();
         let out_ports = midi_out.ports();
         let out_port = out_ports.get(1).unwrap();
@@ -343,15 +368,9 @@ impl MidiBackend {
             out: Some(midi_out.connect(out_port, "tonic-test").unwrap()),
         }
     }
+}
 
-    fn run(&mut self, receiver: Receiver<NoteEvent>) {
-        loop {
-            let e = receiver.recv().unwrap();
-            println!("{:?}", e);
-            self.send(e)
-        }
-    }
-
+impl Backend for MidiBackend {
     fn send(&mut self, event: NoteEvent) {
         let out_port = self.out.as_mut().unwrap();
 
@@ -384,6 +403,7 @@ pub fn main() {
         Event::new(map! {"note" => "62", "duration" => "100"}),
         false,
     );
+
     timeline.schedule_at_next_beat(
         Event::new(map! {"note" => "63", "duration" => "100"}),
         false,
@@ -391,8 +411,9 @@ pub fn main() {
 
     clock.add_timeline(timeline);
 
-    let mut midi_backend = MidiBackend::new("IAC Driver", "IAC Driver Generic");
-    thread::spawn(move || midi_backend.run(note_receiver));
+    // let mut backend = MidiBackend::new("IAC Driver");
+    let mut backend = DummyBackend::new();
+    thread::spawn(move || backend.run(note_receiver));
 
     let handle = thread::spawn(move || clock.run());
     handle.join().unwrap();
