@@ -1,27 +1,31 @@
+#![feature(div_duration)]
+
 extern crate midir;
+extern crate num_cpus;
+extern crate scheduled_thread_pool;
 
 use std::collections::{HashMap, VecDeque};
+use std::env;
+use std::fmt;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use midir::{MidiOutput, MidiOutputConnection};
+use scheduled_thread_pool::ScheduledThreadPool;
 
-/*
-TODO: simple arbitrary precision monotonic clock
-+1+. Use shared midi connection
-2. Improve scheduling (distribute events in bar?)
-2.1. get_next_tick / get_next_beat / get_next_bar
-3. Use parametrized events
- */
-
-const BPM: f64 = 142.0; // beats per minute
-const TPB: f64 = 480.0; // ticks per beat
-const BPB: f64 = 16.0; // beats per bar
+const BPM: u64 = 120; // beats per minute
 
 const NOTE_ON_MSG: u8 = 0x90;
 const NOTE_OFF_MSG: u8 = 0x80;
 const VELOCITY: u8 = 0x64;
+
+fn is_debug() -> bool {
+    match env::var("DEBUG") {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
 
 macro_rules! map(
     { $($key:expr => $value:expr),+ } => {
@@ -35,386 +39,263 @@ macro_rules! map(
      };
 );
 
-#[derive(Debug)]
-pub enum NoteEvent {
-    NoteOn(u8, u8),
-    NoteOff(u8),
-    Sustain(u64),
+#[derive(Debug, Clone)]
+pub struct Clock {
+    start: Instant,
+    bar_start: Instant,
+    bpm: u64,
+    bpb: u64,
+}
+
+fn beat_ms(beat: u64, bpm: u64) -> Duration {
+    Duration::from_millis(beat * (60000 / bpm))
+}
+
+impl Clock {
+    pub fn new(bpm: u64) -> Self {
+        let now = Instant::now();
+
+        Self {
+            start: now,
+            bar_start: now,
+            bpm: bpm,
+            bpb: 4,
+        }
+    }
+
+    fn start(&self) -> Instant {
+        self.start
+    }
+
+    fn start_at(&mut self, start_beat: u64) {
+        let new_start = Instant::now() - self.tick() * start_beat as u32;
+        self.start = new_start;
+    }
+
+    fn bar_start(&self) -> Instant {
+        self.bar_start
+    }
+
+    fn bar_start_at(&mut self, start_bar: u64) {
+        let new_bar_start = Instant::now() - self.tock() * start_bar as u32;
+        self.bar_start = new_bar_start;
+    }
+
+    fn tick(&self) -> Duration {
+        beat_ms(1, self.bpm)
+    }
+
+    fn tock(&self) -> Duration {
+        beat_ms(self.bpb, self.bpm)
+    }
+
+    fn beat(&self) -> u64 {
+        let delta: Duration = Instant::now() - self.start;
+        let current_beat = delta.div_duration_f64(self.tick());
+        (current_beat + 1.0) as u64
+    }
+
+    fn beat_at(&self, beat: u64) -> Instant {
+        self.start + beat as u32 * self.tick()
+    }
+
+    fn beat_phase(&self) -> f64 {
+        let delta = Instant::now() - self.start;
+        let current_beat = delta.div_duration_f64(self.tick());
+        current_beat - current_beat.trunc()
+    }
+
+    fn bar(&self) -> u64 {
+        let delta: Duration = Instant::now() - self.bar_start;
+        let current_bar = delta.div_duration_f64(self.tock());
+        (current_bar + 1.0) as u64
+    }
+
+    fn bar_at(&self, bar: u64) -> Instant {
+        self.bar_start + bar as u32 * self.tock()
+    }
+
+    fn bar_phase(&self) -> f64 {
+        let delta: Duration = Instant::now() - self.start;
+        let current_bar = delta.div_duration_f64(self.tock());
+        current_bar - current_bar.trunc()
+    }
+
+    fn bpm(&self) -> u64 {
+        self.bpm
+    }
+
+    fn set_bpm(&mut self, new_bpm: u64) {
+        let current_beat = self.beat();
+        let current_bar = self.bar();
+        let new_tick = beat_ms(1, new_bpm);
+        let new_tock = new_tick * self.bpb as u32;
+        let new_start = self.beat_at(current_beat) - new_tick * current_beat as u32;
+        let new_bar_start = self.bar_at(current_bar) - new_tock * current_bar as u32;
+        self.start = new_start;
+        self.bar_start = new_bar_start;
+        self.bpm = new_bpm;
+    }
+
+    fn bpb(&self) -> u64 {
+        self.bpb
+    }
+
+    fn set_bpb(&mut self, new_bpb: u64) {
+        let current_bar = self.bar();
+        let new_tock = beat_ms(new_bpb, self.bpm);
+        let new_bar_start = self.bar_at(current_bar) - new_tock * current_bar as u32;
+        self.bar_start = new_bar_start;
+        self.bpb = new_bpb;
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Event {
-    params: HashMap<String, String>,
+    value: String,
 }
 
 impl Event {
-    pub fn new(params: HashMap<String, String>) -> Self {
-        Self { params: params }
-    }
-
-    fn get_note(&self) -> u8 {
-        self.params
-            .get("note")
-            .unwrap()
-            .trim()
-            .parse::<u8>()
-            .unwrap()
-    }
-
-    fn get_duration(&self) -> u64 {
-        self.params
-            .get("duration")
-            .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap()
-    }
-}
-
-trait NoteEventsProducer {
-    fn get_notes(&self) -> Vec<NoteEvent>;
-}
-
-impl NoteEventsProducer for Event {
-    fn get_notes(&self) -> Vec<NoteEvent> {
-        let note = self.get_note();
-        let duration = self.get_duration();
-        vec![
-            NoteEvent::NoteOn(note, VELOCITY),
-            NoteEvent::Sustain(duration),
-            NoteEvent::NoteOff(note),
-        ]
+    pub fn new(value: String) -> Self {
+        Self { value }
     }
 }
 
 #[derive(Debug)]
-pub enum Quantize {
-    Bar,
-    Beat,
-    Tick,
+pub struct Timeline<'a> {
+    clock: &'a Clock,
+    scheduler: &'a Scheduler,
+    receiver: Receiver<(Event, u64)>,
 }
 
-#[derive(Debug)]
-pub struct TimelineEvent {
-    event: Event,
-    scheduled_at: Instant,
-    reschedule: bool,
-    quantize: Quantize,
-}
-
-#[derive(Debug)]
-pub struct Timeline {
-    current_time: Instant,
-    tick_duration: Duration,
-    ticks_per_beat: f64,
-    ticks_per_bar: f64,
-    current_tick: u32,
-    current_beat: i32,
-    current_bar: i32,
-    events: VecDeque<Box<TimelineEvent>>,
-    sender: Sender<NoteEvent>,
-}
-
-impl Timeline {
-    pub fn new(bpm: f64, tpb: f64, sender: Sender<NoteEvent>) -> Self {
-        let tick_duration = Duration::from_secs_f64(60.0 / bpm / tpb);
-
+impl<'a> Timeline<'a> {
+    pub fn new(
+        clock: &'a Clock,
+        scheduler: &'a Scheduler,
+        receiver: Receiver<(Event, u64)>,
+    ) -> Self {
         Self {
-            current_time: Instant::now(),
-            tick_duration: tick_duration,
-            current_tick: 0,
-            current_beat: 0,
-            current_bar: 0,
-            events: VecDeque::new(),
-            sender: sender,
-            ticks_per_beat: tpb,
-            ticks_per_bar: tpb * BPB,
+            clock,
+            scheduler,
+            receiver,
         }
-    }
-
-    // TODO:
-    // +1. get event from scheduled events (nearest)
-    // +2. check event timing
-    // +?3. quantize?
-
-    fn process(&mut self) {
-        println!("events = {:?}", self.events);
-
-        match self.events.pop_front() {
-            Some(te) => {
-                let e = te.event;
-
-                if te.scheduled_at <= self.current_time {
-                    let notes = e.get_notes();
-                    for note in notes {
-                        let _ = self.sender.send(note);
-                    }
-
-                    if te.reschedule {
-                        match te.quantize {
-                            Quantize::Bar => self.schedule_at_next_bar(e, true),
-                            Quantize::Beat => self.schedule_at_next_beat(e, true),
-                            quantize => self.schedule_at(e, te.scheduled_at, true, quantize),
-                        }
-                    }
-                } else {
-                    self.schedule_at(e, te.scheduled_at, te.reschedule, te.quantize);
-                }
-            }
-            None => (),
-        }
-    }
-
-    fn beat(&mut self) {
-        println!("beat: {}", self.current_beat);
-        self.process();
-    }
-
-    fn bar(&mut self) {
-        println!("bar: {}", self.current_bar);
-    }
-
-    fn tick_to_beat(&self, tick: u32) -> u32 {
-        return tick / TPB as u32 % BPB as u32;
-    }
-
-    fn tick_to_bar(&self, tick: u32) -> u32 {
-        return tick / TPB as u32 / BPB as u32;
-    }
-
-    fn next_beat_at(&self) -> Instant {
-        let ticks_to_next_beat = self.current_tick % self.ticks_per_beat as u32;
-        self.current_time + self.tick_duration * ticks_to_next_beat
-    }
-
-    fn next_bar_at(&self) -> Instant {
-        let ticks_to_next_bar =
-            self.ticks_per_bar as u32 - self.current_tick % self.ticks_per_bar as u32;
-        self.current_time + self.tick_duration * ticks_to_next_bar
-    }
-
-    fn tick(&mut self) {
-        self.current_time += self.tick_duration;
-        self.current_tick += 1;
-
-        // advance bar
-        let bar = self.tick_to_bar(self.current_tick) as i32;
-        if self.current_bar != bar {
-            self.current_bar = bar;
-            self.bar();
-        }
-
-        // advance beat
-        let beat = self.tick_to_beat(self.current_tick) as i32;
-        if self.current_beat != beat {
-            self.current_beat = beat;
-            self.beat();
-        }
-
-        // println!(
-        //     "time = {:?}, tick = {}, beat = {}",
-        //     self.current_time, self.current_tick, self.current_beat
-        // );
-    }
-
-    fn update_time(&mut self) {
-        self.current_time = Instant::now();
-    }
-
-    fn schedule(&mut self, event: Event, reschedule: bool) {
-        self.update_time();
-
-        let te = TimelineEvent {
-            event: event,
-            scheduled_at: self.current_time,
-            reschedule: reschedule,
-            quantize: Quantize::Tick,
-        };
-
-        self.events.push_back(Box::new(te));
-    }
-
-    fn schedule_at(&mut self, event: Event, at: Instant, reschedule: bool, quantize: Quantize) {
-        self.update_time();
-
-        let te = TimelineEvent {
-            event: event,
-            scheduled_at: at,
-            reschedule: reschedule,
-            quantize: quantize,
-        };
-
-        self.events.push_back(Box::new(te));
-    }
-
-    fn schedule_at_next_beat(&mut self, event: Event, reschedule: bool) {
-        self.update_time();
-
-        let te = TimelineEvent {
-            event: event,
-            scheduled_at: self.next_beat_at(),
-            reschedule: reschedule,
-            quantize: Quantize::Beat,
-        };
-
-        self.events.push_back(Box::new(te));
-    }
-
-    fn schedule_at_next_bar(&mut self, event: Event, reschedule: bool) {
-        self.update_time();
-
-        let te = TimelineEvent {
-            event: event,
-            scheduled_at: self.next_bar_at(),
-            reschedule: reschedule,
-            quantize: Quantize::Bar,
-        };
-
-        self.events.push_back(Box::new(te));
-    }
-}
-
-#[derive(Debug)]
-pub struct Clock {
-    beats_per_minute: f64,
-    ticks_per_beat: f64,
-    tick_duration: Duration,
-    tick_duration_doubled: Duration,
-    timelines: Vec<Box<Timeline>>,
-}
-
-impl Clock {
-    // UNSTOPPABLE CLOCK!
-    // IMMUTABLE CLOCK!
-    pub fn new(bpm: f64, tpb: f64) -> Self {
-        let tick_duration = Duration::from_secs_f64(60.0 / bpm / tpb);
-
-        Self {
-            beats_per_minute: bpm,
-            ticks_per_beat: tpb,
-            tick_duration: tick_duration,
-            tick_duration_doubled: tick_duration * 2,
-            timelines: Vec::new(),
-        }
-    }
-
-    fn new_timeline(&mut self, sender: Sender<NoteEvent>) -> Timeline {
-        Timeline::new(self.beats_per_minute, self.ticks_per_beat, sender)
-    }
-
-    fn add_timeline(&mut self, timeline: Timeline) {
-        self.timelines.push(Box::new(timeline));
     }
 
     fn run(&mut self) {
-        let mut clock0 = Instant::now();
-        let mut clock1 = clock0;
-
         loop {
-            if clock1 - clock0 >= self.tick_duration_doubled {
-                let delayed_time = clock1 - clock0 - self.tick_duration_doubled;
-                println!("delayed... {:#?} / {:#?}", delayed_time, self.tick_duration);
+            match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
+                Ok((event, beat)) => self.scheduler.schedule_at(self.clock.beat_at(beat), event),
+                Err(_) => thread::sleep(Duration::from_millis(100)),
             }
-
-            while clock1 - clock0 >= self.tick_duration {
-                clock0 += self.tick_duration;
-                for t in self.timelines.iter_mut() {
-                    t.tick()
-                }
-            }
-
-            thread::sleep(Duration::from_secs_f64(0.0001));
-            clock1 = Instant::now();
         }
-    }
-}
-
-trait Backend {
-    fn run(&mut self, receiver: Receiver<NoteEvent>) {
-        loop {
-            let e = receiver.recv().unwrap();
-            self.send(e)
-        }
-    }
-
-    fn send(&mut self, event: NoteEvent);
-}
-
-struct DummyBackend {}
-
-impl DummyBackend {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Backend for DummyBackend {
-    fn send(&mut self, event: NoteEvent) {
-        println!("got event: {:?}", event)
     }
 }
 
 struct MidiBackend {
     out: Option<MidiOutputConnection>,
+    receiver: Receiver<Event>,
 }
 
 impl MidiBackend {
-    fn new(device_name: &str) -> Self {
+    fn new(device_name: &str, receiver: Receiver<Event>) -> Self {
         let midi_out = MidiOutput::new(&device_name).unwrap();
         let out_ports = midi_out.ports();
         let out_port = out_ports.get(1).unwrap();
+        let out = Some(midi_out.connect(out_port, "tonic-test").unwrap());
+        Self { out, receiver }
+    }
 
-        Self {
-            out: Some(midi_out.connect(out_port, "tonic-test").unwrap()),
+    fn run(&mut self) {
+        loop {
+            match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
+                Ok(event) => self.on_event(event),
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
         }
+    }
+
+    fn on_event(&mut self, event: Event) {
+        let out_port = self.out.as_mut().unwrap();
+        let note = event.value.parse::<u8>().unwrap();
+        out_port.send(&[NOTE_ON_MSG, note, VELOCITY]);
     }
 }
 
-impl Backend for MidiBackend {
-    fn send(&mut self, event: NoteEvent) {
-        let out_port = self.out.as_mut().unwrap();
+pub struct Scheduler {
+    thread_pool: ScheduledThreadPool,
+    sender: Option<Sender<Event>>,
+}
 
-        let _ = match event {
-            NoteEvent::NoteOn(note, velocity) => out_port.send(&[NOTE_ON_MSG, note, velocity]),
-            NoteEvent::NoteOff(note) => out_port.send(&[NOTE_OFF_MSG, note, VELOCITY]),
-            NoteEvent::Sustain(duration) => Ok(thread::sleep(Duration::from_millis(duration))),
-        };
+impl Scheduler {
+    pub fn new() -> Self {
+        let thread_pool = ScheduledThreadPool::new(num_cpus::get());
+        Self {
+            thread_pool,
+            sender: None,
+        }
+    }
+
+    fn start_backend(&mut self) {
+        let (sender, receiver) = channel();
+        self.sender = Some(sender);
+        thread::spawn(move || {
+            let mut backend = MidiBackend::new("IAC Driver", receiver);
+            backend.run()
+        });
+    }
+
+    fn schedule_at(&self, at: Instant, event: Event) {
+        let now = Instant::now();
+        let delay = at - now;
+        let sender = self.sender.as_ref().unwrap().clone();
+        self.thread_pool.execute_after(delay, move || {
+            sender.send(event);
+        });
+    }
+}
+
+impl fmt::Debug for Scheduler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scheduler").finish()
     }
 }
 
 pub fn main() {
-    let (note_sender, note_receiver) = channel();
+    let (sender, receiver) = channel();
 
-    let mut clock = Clock::new(BPM, TPB);
+    let s1 = sender.clone();
+    let generator1 = thread::spawn(move || {
+        let mut b = 1;
+        loop {
+            s1.send((Event::new("60".to_string()), b));
+            s1.send((Event::new("65".to_string()), b + 1));
+            s1.send((Event::new("73".to_string()), b + 2));
+            b += 4;
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 
-    let mut timeline = clock.new_timeline(note_sender);
+    let s2 = sender.clone();
+    let generator2 = thread::spawn(move || {
+        let mut b = 5;
+        loop {
+            s2.send((Event::new("35".to_string()), b));
+            s2.send((Event::new("40".to_string()), b + 1));
+            s2.send((Event::new("43".to_string()), b + 2));
+            b += 8;
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
 
-    timeline.schedule_at_next_bar(Event::new(map! {"note" => "76", "duration" => "50"}), true);
+    let player = thread::spawn(move || {
+        let mut clock = Clock::new(BPM);
 
-    timeline.schedule_at_next_beat(
-        Event::new(map! {"note" => "60", "duration" => "100"}),
-        false,
-    );
-    timeline.schedule_at_next_beat(
-        Event::new(map! {"note" => "61", "duration" => "100"}),
-        false,
-    );
-    timeline.schedule_at_next_beat(
-        Event::new(map! {"note" => "62", "duration" => "100"}),
-        false,
-    );
+        let mut scheduler = Scheduler::new();
+        scheduler.start_backend();
 
-    timeline.schedule_at_next_beat(
-        Event::new(map! {"note" => "63", "duration" => "100"}),
-        false,
-    );
+        let mut timeline = Timeline::new(&clock, &scheduler, receiver);
+        timeline.run();
+    });
 
-    clock.add_timeline(timeline);
-
-    // let mut backend = MidiBackend::new("IAC Driver");
-    let mut backend = DummyBackend::new();
-    thread::spawn(move || backend.run(note_receiver));
-
-    let handle = thread::spawn(move || clock.run());
-    handle.join().unwrap();
+    player.join();
 }
