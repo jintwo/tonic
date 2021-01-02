@@ -4,8 +4,6 @@ extern crate midir;
 extern crate num_cpus;
 extern crate scheduled_thread_pool;
 
-use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::fmt;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -19,25 +17,6 @@ const BPM: u64 = 120; // beats per minute
 const NOTE_ON_MSG: u8 = 0x90;
 const NOTE_OFF_MSG: u8 = 0x80;
 const VELOCITY: u8 = 0x64;
-
-fn is_debug() -> bool {
-    match env::var("DEBUG") {
-        Ok(_) => true,
-        Err(_) => false,
-    }
-}
-
-macro_rules! map(
-    { $($key:expr => $value:expr),+ } => {
-        {
-            let mut m = ::std::collections::HashMap::new();
-            $(
-                m.insert(String::from($key), String::from($value));
-            )+
-            m
-        }
-     };
-);
 
 #[derive(Debug, Clone)]
 pub struct Clock {
