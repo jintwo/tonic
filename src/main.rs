@@ -164,7 +164,7 @@ impl<'a> Timeline<'a> {
         loop {
             match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
                 Ok((event, beat)) => self.scheduler.schedule_at(self.clock.beat_at(beat), event),
-                Err(_) => thread::sleep(Duration::from_millis(100)),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }
     }
@@ -188,7 +188,7 @@ impl MidiBackend {
         loop {
             match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
                 Ok(event) => self.on_event(event),
-                Err(_) => thread::sleep(Duration::from_millis(100)),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }
     }
@@ -196,7 +196,7 @@ impl MidiBackend {
     fn on_event(&mut self, event: Event) {
         let out_port = self.out.as_mut().unwrap();
         let note = event.value.parse::<u8>().unwrap();
-        out_port.send(&[NOTE_ON_MSG, note, VELOCITY]);
+        out_port.send(&[NOTE_ON_MSG, note, VELOCITY]).unwrap();
     }
 }
 
@@ -228,7 +228,7 @@ impl Scheduler {
         let delay = at - now;
         let sender = self.sender.as_ref().unwrap().clone();
         self.thread_pool.execute_after(delay, move || {
-            sender.send(event);
+            sender.send(event).unwrap();
         });
     }
 }
@@ -239,35 +239,50 @@ impl fmt::Debug for Scheduler {
     }
 }
 
-pub fn main() {
-    let (sender, receiver) = channel();
-
-    let s1 = sender.clone();
-    let generator1 = thread::spawn(move || {
+fn gen(s: &Sender<(Event, u64)>, f: fn(&Sender<(Event, u64)>, u64)) {
+    let out = s.clone();
+    thread::spawn(move || {
         let mut b = 1;
         loop {
-            s1.send((Event::new("60".to_string()), b));
-            s1.send((Event::new("65".to_string()), b + 1));
-            s1.send((Event::new("73".to_string()), b + 2));
-            b += 4;
+            f(&out, *(&b));
+            b += 1;
             thread::sleep(Duration::from_millis(50));
         }
     });
+}
 
-    let s2 = sender.clone();
-    let generator2 = thread::spawn(move || {
-        let mut b = 5;
-        loop {
-            s2.send((Event::new("35".to_string()), b));
-            s2.send((Event::new("40".to_string()), b + 1));
-            s2.send((Event::new("43".to_string()), b + 2));
-            b += 8;
-            thread::sleep(Duration::from_millis(50));
+// TODO: graceful shutdown
+pub fn main() {
+    let (sender, receiver) = channel();
+
+    gen(&sender, |s, beat| {
+        if beat < 50 && beat % 4 == 0 {
+            s.send((Event::new("60".to_string()), beat)).unwrap();
+            s.send((Event::new("65".to_string()), beat + 1)).unwrap();
+            s.send((Event::new("73".to_string()), beat + 2)).unwrap();
+        }
+    });
+
+    gen(&sender, |s, beat| {
+        if beat < 100 && beat % 7 == 0 {
+            s.send((Event::new("35".to_string()), beat)).unwrap();
+            s.send((Event::new("40".to_string()), beat + 1)).unwrap();
+            s.send((Event::new("43".to_string()), beat + 2)).unwrap();
+        }
+    });
+
+    gen(&sender, |s, beat| {
+        if beat > 50 && beat % 3 == 0 {
+            s.send((Event::new("81".to_string()), beat)).unwrap();
+        }
+
+        if beat > 100 && beat % 5 == 0 {
+            s.send((Event::new("86".to_string()), beat)).unwrap();
         }
     });
 
     let player = thread::spawn(move || {
-        let mut clock = Clock::new(BPM);
+        let clock = Clock::new(BPM);
 
         let mut scheduler = Scheduler::new();
         scheduler.start_backend();
@@ -276,5 +291,5 @@ pub fn main() {
         timeline.run();
     });
 
-    player.join();
+    player.join().unwrap();
 }
