@@ -132,104 +132,100 @@ impl Clock {
 #[derive(Debug, Clone)]
 pub struct Event {
     value: String,
+    beat: u64,
 }
 
 impl Event {
-    pub fn new(value: String) -> Self {
-        Self { value }
+    pub fn new(value: String, beat: u64) -> Self {
+        Self { value, beat }
     }
 }
 
-#[derive(Debug)]
-pub struct Timeline<'a> {
-    clock: &'a Clock,
-    scheduler: &'a Scheduler,
-    receiver: Receiver<(Event, u64)>,
+pub trait Backend {
+    fn run(&mut self, receiver: Receiver<Event>);
 }
 
-impl<'a> Timeline<'a> {
-    pub fn new(
-        clock: &'a Clock,
-        scheduler: &'a Scheduler,
-        receiver: Receiver<(Event, u64)>,
-    ) -> Self {
-        Self {
-            clock,
-            scheduler,
-            receiver,
-        }
-    }
+struct DummyBackend;
 
-    fn run(&mut self) {
-        loop {
-            match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
-                Ok((event, beat)) => self.scheduler.schedule_at(self.clock.beat_at(beat), event),
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
-        }
+impl DummyBackend {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Backend for DummyBackend {
+    fn run(&mut self, receiver: Receiver<Event>) {
+        thread::spawn(move || loop {
+            let event = receiver.recv().unwrap();
+            println!("[dummy] got event: {:?}", event);
+        });
     }
 }
 
 struct MidiBackend {
-    out: Option<MidiOutputConnection>,
-    receiver: Receiver<Event>,
+    device_name: String,
 }
 
 impl MidiBackend {
-    fn new(device_name: &str, receiver: Receiver<Event>) -> Self {
-        let midi_out = MidiOutput::new(&device_name).unwrap();
-        let out_ports = midi_out.ports();
-        let out_port = out_ports.get(1).unwrap();
-        let out = Some(midi_out.connect(out_port, "tonic-test").unwrap());
-        Self { out, receiver }
-    }
-
-    fn run(&mut self) {
-        loop {
-            match self.receiver.recv_timeout(Duration::from_secs_f64(0.0001)) {
-                Ok(event) => self.on_event(event),
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
+    fn new(device_name: &str) -> Self {
+        Self {
+            device_name: String::from(device_name),
         }
     }
 
-    fn on_event(&mut self, event: Event) {
-        let out_port = self.out.as_mut().unwrap();
-        let note = event.value.parse::<u8>().unwrap();
-        out_port.send(&[NOTE_ON_MSG, note, VELOCITY]).unwrap();
+    fn init_output(&mut self) -> MidiOutputConnection {
+        let midi_out = MidiOutput::new(self.device_name.as_ref()).unwrap();
+        let out_ports = midi_out.ports();
+        let out_port = out_ports.get(1).unwrap();
+        midi_out.connect(out_port, "tonic-test").unwrap()
+    }
+}
+
+impl Backend for MidiBackend {
+    fn run(&mut self, receiver: Receiver<Event>) {
+        let mut out = self.init_output();
+
+        thread::spawn(move || loop {
+            let event = receiver.recv().unwrap();
+            let note = event.value.parse::<u8>().unwrap();
+            out.send(&[NOTE_ON_MSG, note, VELOCITY]).unwrap();
+        });
     }
 }
 
 pub struct Scheduler {
     thread_pool: ScheduledThreadPool,
-    sender: Option<Sender<Event>>,
+    producers: Vec<Sender<Event>>,
+    backends: Vec<Box<dyn Backend>>,
 }
 
 impl Scheduler {
-    pub fn new() -> Self {
+    pub fn new(backends: Vec<Box<dyn Backend>>) -> Self {
         let thread_pool = ScheduledThreadPool::new(num_cpus::get());
         Self {
             thread_pool,
-            sender: None,
+            producers: vec![],
+            backends: backends,
         }
     }
 
-    fn start_backend(&mut self) {
-        let (sender, receiver) = channel();
-        self.sender = Some(sender);
-        thread::spawn(move || {
-            let mut backend = MidiBackend::new("IAC Driver", receiver);
-            backend.run()
-        });
+    fn start_backends(&mut self) {
+        for backend in self.backends.iter_mut() {
+            let (sender, receiver) = channel();
+            self.producers.push(sender);
+            backend.run(receiver);
+        }
     }
 
     fn schedule_at(&self, at: Instant, event: Event) {
-        let now = Instant::now();
-        let delay = at - now;
-        let sender = self.sender.as_ref().unwrap().clone();
-        self.thread_pool.execute_after(delay, move || {
-            sender.send(event).unwrap();
-        });
+        for producer in self.producers.iter() {
+            let sender = producer.clone();
+            let delay = at - Instant::now();
+            let evt = event.clone();
+            self.thread_pool.execute_after(delay, move || {
+                sender.send(evt).unwrap();
+            });
+        }
     }
 }
 
@@ -239,14 +235,18 @@ impl fmt::Debug for Scheduler {
     }
 }
 
-fn gen(s: &Sender<(Event, u64)>, f: fn(&Sender<(Event, u64)>, u64)) {
+fn gen(s: &Sender<Event>, f: fn(&u64) -> Vec<Event>) {
     let out = s.clone();
     thread::spawn(move || {
-        let mut b = 1;
+        let mut beat = 1;
         loop {
-            f(&out, *(&b));
-            b += 1;
-            thread::sleep(Duration::from_millis(50));
+            let events = f(&beat);
+            for e in events {
+                out.send(e).unwrap();
+            }
+            beat += 1;
+            // sleep for a beat
+            thread::sleep(beat_ms(1, BPM));
         }
     });
 }
@@ -255,40 +255,58 @@ fn gen(s: &Sender<(Event, u64)>, f: fn(&Sender<(Event, u64)>, u64)) {
 pub fn main() {
     let (sender, receiver) = channel();
 
-    gen(&sender, |s, beat| {
+    gen(&sender, |&beat| {
         if beat < 50 && beat % 4 == 0 {
-            s.send((Event::new("60".to_string()), beat)).unwrap();
-            s.send((Event::new("65".to_string()), beat + 1)).unwrap();
-            s.send((Event::new("73".to_string()), beat + 2)).unwrap();
+            return vec![
+                Event::new("60".to_string(), beat),
+                Event::new("65".to_string(), beat + 1),
+                Event::new("73".to_string(), beat + 2),
+            ];
         }
+
+        vec![]
     });
 
-    gen(&sender, |s, beat| {
+    gen(&sender, |&beat| {
         if beat < 100 && beat % 7 == 0 {
-            s.send((Event::new("35".to_string()), beat)).unwrap();
-            s.send((Event::new("40".to_string()), beat + 1)).unwrap();
-            s.send((Event::new("43".to_string()), beat + 2)).unwrap();
+            return vec![
+                Event::new("35".to_string(), beat),
+                Event::new("40".to_string(), beat + 1),
+                Event::new("43".to_string(), beat + 2),
+            ];
         }
+
+        vec![]
     });
 
-    gen(&sender, |s, beat| {
+    gen(&sender, |&beat| {
+        let mut events: Vec<Event> = vec![];
+
         if beat > 50 && beat % 3 == 0 {
-            s.send((Event::new("81".to_string()), beat)).unwrap();
+            events.push(Event::new("81".to_string(), beat))
         }
 
         if beat > 100 && beat % 5 == 0 {
-            s.send((Event::new("86".to_string()), beat)).unwrap();
+            events.push(Event::new("86".to_string(), beat))
         }
+
+        events
     });
 
     let player = thread::spawn(move || {
         let clock = Clock::new(BPM);
 
-        let mut scheduler = Scheduler::new();
-        scheduler.start_backend();
+        let mut scheduler = Scheduler::new(vec![
+            Box::new(MidiBackend::new("IAC Driver")),
+            Box::new(DummyBackend::new()),
+        ]);
 
-        let mut timeline = Timeline::new(&clock, &scheduler, receiver);
-        timeline.run();
+        scheduler.start_backends();
+
+        loop {
+            let event = receiver.recv().unwrap();
+            scheduler.schedule_at(clock.beat_at(event.beat), event);
+        }
     });
 
     player.join().unwrap();
