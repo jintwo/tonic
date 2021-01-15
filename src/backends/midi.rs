@@ -20,16 +20,10 @@ impl MidiEvent for Event {
 }
 
 pub struct MidiBackend {
-    device_name: String,
+    pub device_name: String,
 }
 
 impl MidiBackend {
-    pub fn new(device_name: &str) -> Self {
-        Self {
-            device_name: String::from(device_name),
-        }
-    }
-
     fn init_output(&mut self) -> midir::MidiOutputConnection {
         let midi_out = midir::MidiOutput::new(self.device_name.as_ref()).unwrap();
         let out_ports = midi_out.ports();

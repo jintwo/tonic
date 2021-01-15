@@ -34,7 +34,13 @@ fn gen(s: &Sender<Event>, f: fn(&u64) -> Vec<Event>) {
     });
 }
 
-// TODO: graceful shutdown
+/* TODO:
+1. graceful shutdown
+2. lock generators to until clock is started
+3. ableton-link
+4. generators composition (beat merge?)
+*/
+
 pub fn main() {
     let (sender, receiver) = channel();
 
@@ -80,8 +86,10 @@ pub fn main() {
         let clock = Clock::new(BPM);
 
         let mut scheduler = Scheduler::new(vec![
-            Box::new(MidiBackend::new("IAC Driver")),
-            Box::new(DummyBackend::new()),
+            Box::new(MidiBackend {
+                device_name: String::from("IAC Driver"),
+            }),
+            Box::new(DummyBackend {}),
         ]);
 
         scheduler.start_backends();

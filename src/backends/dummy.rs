@@ -6,12 +6,6 @@ use crate::event::Event;
 
 pub struct DummyBackend;
 
-impl DummyBackend {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
 impl Backend for DummyBackend {
     fn run(&mut self, receiver: Receiver<Event>) {
         thread::spawn(move || loop {
