@@ -7,10 +7,14 @@ use crate::event::Event;
 pub struct DummyBackend;
 
 impl Backend for DummyBackend {
-    fn run(&mut self, receiver: Receiver<Event>) {
+    fn run(&self, receiver: Receiver<Event>) {
         thread::spawn(move || loop {
-            let event = receiver.recv().unwrap();
-            println!("[dummy] got event: {:?}", event);
+            match receiver.recv() {
+                Ok(event) => {
+                    println!("[dummy] got event: {:?}", event);
+                }
+                Err(_) => {}
+            }
         });
     }
 }

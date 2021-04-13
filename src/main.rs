@@ -2,6 +2,8 @@
 
 mod clock;
 use clock::{beat_ms, Clock};
+use std::cell::RefCell;
+use std::sync::Arc;
 
 mod event;
 use event::Event;
@@ -39,6 +41,7 @@ fn gen(s: &Sender<Event>, f: fn(&u64) -> Vec<Event>) {
 2. lock generators to until clock is started
 3. ableton-link
 4. generators composition (beat merge?)
+5. crossbeam-channel (mpMc)
 */
 
 pub fn main() {
@@ -82,15 +85,15 @@ pub fn main() {
         events
     });
 
-    let player = thread::spawn(move || {
-        let clock = Clock::new(BPM);
+    let clock = Arc::new(Clock::new(BPM));
 
-        let mut scheduler = Scheduler::new(vec![
+    let player = thread::spawn(move || {
+        let scheduler = Scheduler::new(RefCell::new(vec![
             Box::new(MidiBackend {
                 device_name: String::from("IAC Driver"),
             }),
             Box::new(DummyBackend {}),
-        ]);
+        ]));
 
         scheduler.start_backends();
 

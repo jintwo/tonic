@@ -6,5 +6,5 @@ pub mod dummy;
 pub mod midi;
 
 pub trait Backend {
-    fn run(&mut self, receiver: Receiver<Event>);
+    fn run(&self, receiver: Receiver<Event>);
 }

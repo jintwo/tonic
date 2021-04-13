@@ -24,7 +24,7 @@ pub struct MidiBackend {
 }
 
 impl MidiBackend {
-    fn init_output(&mut self) -> midir::MidiOutputConnection {
+    fn init_output(&self) -> midir::MidiOutputConnection {
         let midi_out = midir::MidiOutput::new(self.device_name.as_ref()).unwrap();
         let out_ports = midi_out.ports();
         let out_port = out_ports.get(1).unwrap();
@@ -33,13 +33,18 @@ impl MidiBackend {
 }
 
 impl Backend for MidiBackend {
-    fn run(&mut self, receiver: Receiver<Event>) {
+    fn run(&self, receiver: Receiver<Event>) {
         let mut out = self.init_output();
 
         thread::spawn(move || loop {
-            let event = receiver.recv().unwrap();
-            let midi_event = event.to_midi();
-            out.send(&midi_event).unwrap();
+            match receiver.recv() {
+                Ok(event) => {
+                    println!("[midi] got event: {:?}", event);
+                    let midi_event = event.to_midi();
+                    out.send(&midi_event).unwrap();
+                }
+                Err(_) => {}
+            }
         });
     }
 }
